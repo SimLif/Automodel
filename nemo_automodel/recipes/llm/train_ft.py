@@ -30,10 +30,16 @@ from torch.utils.data import DataLoader, IterableDataset
 from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 from torchdata.stateful_dataloader.sampler import StatefulDistributedSampler
 from transformers import AutoConfig
-from transformers.modeling_utils import no_init_weights
+try:
+    from transformers.modeling_utils import no_init_weights
+except ImportError:
+    from transformers.initialization import no_init_weights
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
-from transformers.utils.hub import TRANSFORMERS_CACHE
+try:
+    from transformers.utils import TRANSFORMERS_CACHE, ContextManagers
+except ImportError:
+    from transformers.utils import ContextManagers
+    from transformers.utils import HF_HUB_CACHE as TRANSFORMERS_CACHE
 from wandb import Settings
 
 from nemo_automodel._transformers.auto_tokenizer import NeMoAutoTokenizer
@@ -530,17 +536,37 @@ def build_dataloader(
             if "shuffle" in cfg_dl:
                 del cfg_dl.shuffle
 
-            dist_sampler_kwargs = {
-                "num_replicas": dp_world_size,
-                "rank": dp_rank,
-                "shuffle": shuffle,
-            }
-            sampler = StatefulDistributedSampler(
-                ds,
-                seed=seed,
-                drop_last=True,
-                **dist_sampler_kwargs,
-            )
+            # Check for block shuffle configuration (for AFS/NFS remote I/O optimization)
+            block_shuffle_block_size = cfg_dl.get("block_shuffle_block_size", 0)
+            if "block_shuffle_block_size" in cfg_dl:
+                del cfg_dl.block_shuffle_block_size
+
+            if block_shuffle_block_size > 0:
+                from ernie.data.block_shuffle_sampler import BlockShuffleSampler
+                logging.info(
+                    f"Using BlockShuffleSampler: block_size={block_shuffle_block_size}, "
+                    f"shuffle={shuffle}, rank={dp_rank}/{dp_world_size}"
+                )
+                sampler = BlockShuffleSampler(
+                    ds,
+                    block_size=block_shuffle_block_size,
+                    shuffle=shuffle,
+                    seed=seed,
+                    num_replicas=dp_world_size,
+                    rank=dp_rank,
+                )
+            else:
+                dist_sampler_kwargs = {
+                    "num_replicas": dp_world_size,
+                    "rank": dp_rank,
+                    "shuffle": shuffle,
+                }
+                sampler = StatefulDistributedSampler(
+                    ds,
+                    seed=seed,
+                    drop_last=True,
+                    **dist_sampler_kwargs,
+                )
             dl_kwargs = {"sampler": sampler, "batch_size": local_batch_size}
             if pp_enabled:
                 dl_kwargs["drop_last"] = True
