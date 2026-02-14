@@ -145,16 +145,17 @@ class MetricLogger:
 
 class MetricLoggerDist(MetricLogger):
     def __init__(self, filepath: str, *, flush: bool = False, append: bool = True) -> None:
-        super().__init__(filepath, flush=flush, append=append)
         assert dist.is_initialized(), "torch.distributed must be initialized with MetricLoggerDist"
         self.rank = dist.get_rank()
         self.world_size = dist.get_world_size()
-        # if not main rank, set log and close to no-op
-        if self.rank != 0:
+        if self.rank == 0:
+            super().__init__(filepath, flush=flush, append=append)
+        else:
+            # Non-rank-0: skip all file I/O, set methods to no-op
             self.log = lambda *args, **kwargs: None
             self.close = lambda: None
-            self.__enter__ = lambda: None
-            self.__exit__ = lambda: None
+            self.__enter__ = lambda: self
+            self.__exit__ = lambda *a: None
 
 
 def build_metric_logger(filepath: str, *, flush: bool = False, append: bool = True) -> MetricLogger:
