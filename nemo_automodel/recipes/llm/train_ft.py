@@ -1189,6 +1189,9 @@ class TrainFinetuneRecipeForNextTokenPrediction(BaseRecipe):
         for v in self.metric_logger_valid.values():
             v.close()
 
+        # Flush pending async checkpoint symlinks (LATEST / LOWEST_VAL)
+        self.finalize_async_checkpoints()
+
         self.checkpointer.close()
 
     # ------------------ helpers ------------------

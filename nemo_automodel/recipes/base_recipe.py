@@ -288,6 +288,38 @@ class BaseRecipe:
             if is_dist_initialized:
                 torch.distributed.barrier()
 
+    def finalize_async_checkpoints(self) -> None:
+        """Flush any pending async checkpoint symlinks (LATEST / LOWEST_VAL).
+
+        In async mode the LATEST symlink is deferred until the *next*
+        ``save_checkpoint`` call.  When training ends after the final save,
+        there is no next call, so the symlink never gets updated.
+        Call this method after the training loop to ensure the symlinks
+        point to the most recently saved checkpoint.
+        """
+        if not self.checkpointer.config.enabled:
+            return
+
+        self.checkpointer.async_wait()
+
+        is_dist_initialized = torch.distributed.is_initialized()
+        is_rank_0 = not is_dist_initialized or torch.distributed.get_rank() == 0
+
+        prev_pending = getattr(self, "_last_pending_checkpoint_dir", None)
+        if prev_pending is not None:
+            if is_rank_0:
+                self._update_latest_symlink(prev_pending)
+            setattr(self, "_last_pending_checkpoint_dir", None)
+
+        prev_best = getattr(self, "_last_pending_best_checkpoint_info", None)
+        if prev_best is not None:
+            if is_rank_0 and prev_best.get("val") is not None:
+                self._update_best_symlink(prev_best["path"], float(prev_best["val"]))
+            setattr(self, "_last_pending_best_checkpoint_info", None)
+
+        if is_dist_initialized:
+            torch.distributed.barrier()
+
     def _update_checkpoint_symlink(self, link_name: str, target_dir: str) -> None:
         """
         Create or update a symlink named `link_name` under the checkpoint root

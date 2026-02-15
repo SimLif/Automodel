@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import socket
 import threading
 
 logger = logging.getLogger(__name__)
@@ -92,3 +93,64 @@ def apply_async_checkpoint_patch() -> None:
         pass
     except Exception:
         logger.debug("Unexpected error while applying DCP process executor patch", exc_info=True)
+
+
+def apply_async_port_validation_patch() -> None:
+    """
+    Replace ``get_free_port`` in the DCP async process executor module with a
+    version that validates the port is available on **all interfaces** (0.0.0.0).
+
+    The upstream implementation binds only to localhost, which can miss ports
+    already in use on other interfaces (e.g. by a stale DCP background process).
+    Gloo's ``init_process_group`` binds on 0.0.0.0, causing EADDRINUSE.
+    """
+    try:
+        ape_mod = importlib.import_module(
+            "torch.distributed.checkpoint._async_process_executor"
+        )
+
+        if getattr(ape_mod, "_NEMO_PATCHED_PORT_VALIDATION", False):
+            return
+
+        orig_get_free_port = getattr(ape_mod, "get_free_port", None)
+        if orig_get_free_port is None:
+            return
+
+        def _validated_get_free_port(max_retries: int = 10) -> int:
+            """Get a free port and verify it is bindable on 0.0.0.0."""
+            for attempt in range(max_retries):
+                port = orig_get_free_port()
+                try:
+                    # Verify the port is free on all interfaces
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind(("0.0.0.0", port))
+                    sock.close()
+                    return port
+                except OSError:
+                    logger.debug(
+                        "Port %d busy on 0.0.0.0, retrying (%d/%d)",
+                        port,
+                        attempt + 1,
+                        max_retries,
+                    )
+            # Last resort: let the OS pick a port on 0.0.0.0 directly
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("0.0.0.0", 0))
+            port = sock.getsockname()[1]
+            sock.close()
+            logger.debug("All retries exhausted, OS-assigned port %d on 0.0.0.0", port)
+            return port
+
+        ape_mod.get_free_port = _validated_get_free_port
+        ape_mod._NEMO_PATCHED_PORT_VALIDATION = True
+        logger.debug("Applied 0.0.0.0 port validation patch to DCP get_free_port")
+
+    except ModuleNotFoundError:
+        pass
+    except Exception:
+        logger.debug(
+            "Unexpected error while applying DCP port validation patch",
+            exc_info=True,
+        )
